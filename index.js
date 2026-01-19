@@ -7,6 +7,11 @@ const Config = require('./models/Config');
 const bot = new TelegramBot(process.env.TOKEN, { polling: true });
 const ADMINS = process.env.ADMINS.split(',').map(id => Number(id));
 
+/* ================= GLOBAL ERROR HANDLER ================= */
+process.on('unhandledRejection', (reason) => {
+    console.log('❌ Unhandled Rejection:', reason?.message || reason);
+});
+
 /* ================= DATABASE ================= */
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅ MongoDB ulandi"))
@@ -15,246 +20,356 @@ mongoose.connect(process.env.MONGO_URI)
 /* ================= HELPERS ================= */
 const getConfig = async () => {
     let config = await Config.findOne();
-    if (!config) config = await Config.create({ requiredChannels: [], refAmount: 50 });
+    if (!config) {
+        config = await Config.create({
+            requiredChannels: [],
+            refAmount: 50,
+            bonusAmount: 50,
+            minWithdraw: 10000
+        });
+    }
     if (!config.requiredChannels) config.requiredChannels = [];
     return config;
 };
 
+// Kanalga obuna bo'lishni tekshirish
 const checkChannels = async (userId, config) => {
-    if (!config.requiredChannels || config.requiredChannels.length === 0) return [];
+    if (!config.requiredChannels.length) return [];
     const notSubscribed = [];
-    for (const channel of config.requiredChannels) {
+    for (const ch of config.requiredChannels) {
         try {
-            const member = await bot.getChatMember(channel, userId);
-            if (['left', 'kicked'].includes(member.status)) notSubscribed.push(channel);
+            const member = await bot.getChatMember(ch, userId);
+            if (['left', 'kicked'].includes(member.status)) notSubscribed.push(ch);
         } catch {
-            notSubscribed.push(channel);
+            notSubscribed.push(ch);
         }
     }
     return notSubscribed;
 };
 
-// Faqat foydalanuvchilar uchun obuna xabari
+// Obuna bo'lishni talab qilish
 const sendSubscribeMessage = async (userId, config) => {
-    if (ADMINS.includes(userId)) return true; // adminlar uchun tekshirish yo'q
-
+    if (ADMINS.includes(userId)) return true;
     const notSubscribed = await checkChannels(userId, config);
-    if (notSubscribed.length === 0) return true;
+    if (!notSubscribed.length) return true;
 
-    const buttons = notSubscribed.map(ch => [{ text: `Obuna bo‘lish 🫆`, url: `https://t.me/${ch.replace('@','')}` }]);
+    const buttons = notSubscribed.map(ch => [{ text: `Obuna bo‘lish 🫆`, url: `https://t.me/${ch.replace('@', '')}` }]);
     buttons.push([{ text: "Obuna bo‘ldim ✅", callback_data: "check_sub" }]);
 
-    return bot.sendMessage(userId, `⚠️ Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:`, {
-        reply_markup: { inline_keyboard: buttons }
-    });
+    try {
+        await bot.sendMessage(userId, `⚠️ Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:`, {
+            reply_markup: { inline_keyboard: buttons }
+        });
+    } catch (err) {
+        console.log("❌ sendSubscribeMessage error:", err.message);
+    }
 };
 
-/* ================= START ================= */
-bot.onText(/\/start(?: (\d+))?/, async (msg, match) => {
-    const userId = msg.from.id;
-    const refId = match[1] ? Number(match[1]) : null;
+/* ================= MAIN MENU ================= */
+const showMainMenu = async (userId) => {
     const config = await getConfig();
-
-    if ((await checkChannels(userId, config)).length > 0 && !ADMINS.includes(userId)) 
-        return sendSubscribeMessage(userId, config);
-
-    let user = await User.findOne({ userId });
-    if (!user) {
-        user = await User.create({ userId, refBy: refId, balance: 0, lastBonus: null });
-        if (refId && refId !== userId) {
-            await User.updateOne({ userId: refId }, { $inc: { balance: config.refAmount || 50 } });
-            const username = msg.from.username ? '@' + msg.from.username : msg.from.first_name;
-            bot.sendMessage(refId, `🎉 Sizning yangi obunachingiz qo‘shildi: ${username}\n💰 Sizga ${config.refAmount || 50} so‘m berildi!`);
-        }
-    }
-
-    // ===== ADD OPEN BUTTON (Web App / Website) =====
-    await bot.setChatMenuButton({
-        chat_id: userId,
-        menu_button: {
-            type: "web_app",
-            text: "Open 🌐",
-            web_app: { url: "https://yourwebsite.com" } // sizning sayt URL
-        }
-    });
+    const user = await User.findOne({ userId });
+    if (!user) return;
 
     const keyboard = ADMINS.includes(userId)
         ? [
-            [{ text: "Balans" }, { text: "Bonus" }],
-            [{ text: "Referal Link" }, { text: "Yechib olish" }, { text: "Reklama yuborish" }],
-            [{ text: "Kanal qo‘shish" }, { text: "Kanal o‘chirish" }],
-            [{ text: "Referal pulini sozlash" }]
+            [{ text: "💰 Balans", callback_data: "show_balance" }, { text: "🎁 Bonus", callback_data: "get_bonus" }],
+            [{ text: "🔗 Referal Link", callback_data: "ref_link" }, { text: "📢 Reklama yuborish", callback_data: "send_ad" }],
+            [{ text: "➕ Kanal qo‘shish", callback_data: "add_channel" }, { text: "❌ Kanal o‘chirish", callback_data: "remove_channel" }],
+            [{ text: "🎁 Bonus miqdorini sozlash", callback_data: "set_bonus" }, { text: "💸 Minimal yechish miqdorini sozlash", callback_data: "set_min_withdraw" }],
+            [{ text: "💎 Referal pulini sozlash", callback_data: "set_ref" }]
         ]
         : [
-            [{ text: "Balans" }, { text: "Bonus" }],
-            [{ text: "Referal Link" }, { text: "Yechib olish" }]
+            [{ text: "💰 Balans", callback_data: "show_balance" }, { text: "🎁 Bonus", callback_data: "get_bonus" }],
+            [{ text: "🔗 Referal Link", callback_data: "ref_link" }]
         ];
 
-    bot.sendMessage(userId, "👋 Xush kelibsiz! Menu tugmasidan foydalaning.", { reply_markup: { keyboard, resize_keyboard: true } });
+    try {
+        await bot.sendMessage(userId, "👋 Xush kelibsiz! Tugmalardan foydalaning:", {
+            reply_markup: { inline_keyboard: keyboard }
+        });
+    } catch (err) {
+        console.log("❌ showMainMenu error:", err.message);
+    }
+};
+
+/* ================= START ================= */
+bot.onText(/\/start(.*)/, async (msg, match) => {
+    const userId = msg.from.id;
+    const refId = match[1] ? Number(match[1].trim()) : null;
+
+    let user = await User.findOne({ userId });
+    const config = await getConfig();
+
+    // Agar yangi user bo‘lsa
+    if (!user) {
+        user = await User.create({
+            userId,
+            balance: 0,
+            referredBy: refId || null
+        });
+
+        // REFERAL ORQALI KIRGAN BO‘LSA
+        if (refId && refId !== userId) {
+            const refUser = await User.findOne({ userId: refId });
+
+            if (refUser) {
+                // 🔹 YANGI USERGA BONUS
+                user.balance += 3000;
+                await user.save();
+
+                // 🔹 REFER QILGANGA BONUS
+                refUser.balance += config.refAmount;
+                refUser.refCount = (refUser.refCount || 0) + 1;
+                await refUser.save();
+
+                // Refer qilganga xabar
+                bot.sendMessage(refId,
+                    `🎉 Tabriklaymiz!
+👤 Yangi foydalanuvchi sizning referal linkingiz orqali qo‘shildi.
+💰 Sizga ${config.refAmount} so‘m bonus berildi!`
+                );
+
+                // Yangi userga xabar
+                bot.sendMessage(userId,
+                    `🎁 Xush kelibsiz!
+🔗 Siz referal orqali qo‘shildingiz
+💰 Hisobingizga 3000 so‘m bonus qo‘shildi!`
+                );
+            }
+        }
+    }
+
+    showMainMenu(userId);
 });
+
 
 /* ================= CALLBACK ================= */
 bot.on('callback_query', async (query) => {
     const userId = query.from.id;
     const data = query.data;
     const config = await getConfig();
-
-    if (data === "check_sub") {
-        if ((await checkChannels(userId, config)).length === 0 || ADMINS.includes(userId)) {
-            bot.answerCallbackQuery(query.id, { text: "✅ Obuna bo‘ldingiz!" });
-            bot.deleteMessage(userId, query.message.message_id);
-            bot.emit('text', { text: '/start', from: query.from, chat: { id: userId } });
-        } else {
-            bot.answerCallbackQuery(query.id, { text: "❌ Siz hali barcha kanallarga obuna bo‘lmadingiz!" });
-        }
-    }
-
-    if (data.startsWith("paid_")) {
-        const [, uid, amount] = data.split("_").map(Number);
-        const user = await User.findOne({ userId: uid });
-        if (!user) return;
-        if (user.balance < amount) return bot.answerCallbackQuery(query.id, { text: "❌ Balans yetarli emas!" });
-
-        await User.updateOne({ userId: uid }, { $inc: { balance: -amount } });
-        bot.answerCallbackQuery(query.id, { text: `✅ ${amount} so'm balansdan yechildi` });
-        bot.sendMessage(query.from.id, `✅ Pul foydalanuvchi balansidan yechildi!`);
-        bot.sendMessage(uid, `✅ Sizning yechib olish so‘rovingiz tasdiqlandi. ${amount} so'm yechildi.`);
-    }
-});
-
-/* ================= MESSAGE HANDLER ================= */
-bot.on('message', async (msg) => {
-    const userId = msg.from.id;
-    const text = msg.text;
-    const config = await getConfig();
     const user = await User.findOne({ userId });
     if (!user) return;
-    const now = new Date();
-    const isAdmin = ADMINS.includes(userId);
 
-    if ((await checkChannels(userId, config)).length > 0 && !isAdmin) return sendSubscribeMessage(userId, config);
-
-    // ===== BONUS =====
-    if (text === "Bonus") {
-        if (user.lastBonus && new Date(user.lastBonus).toDateString() === now.toDateString()) 
-            return bot.sendMessage(userId, "⚠️ Bugun bonus olgansiz!");
-        await User.updateOne({ userId }, { $inc: { balance: 50 }, $set: { lastBonus: now } });
-        return bot.sendMessage(userId, "🎁 50 so‘m bonus berildi!");
+    if ((await checkChannels(userId, config)).length && !ADMINS.includes(userId)) {
+        return sendSubscribeMessage(userId, config);
     }
 
-    // ===== BALANS =====
-    if (text === "Balans") {
-        return bot.sendMessage(userId, `💰 Balansingiz: ${user.balance} so'm`);
-    }
+    try {
+        // Obuna tekshiruv
+        if (data === "check_sub") {
+            const notSubscribed = await checkChannels(userId, config);
+            if (!notSubscribed.length || ADMINS.includes(userId)) {
+                await bot.answerCallbackQuery(query.id, { text: "✅ Obuna bo‘ldingiz!" });
+                await bot.deleteMessage(userId, query.message.message_id).catch(() => { });
+                bot.emit('text', { text: '/start', from: query.from, chat: { id: userId } });
+            } else await bot.answerCallbackQuery(query.id, { text: "❌ Siz hali barcha kanallarga obuna bo‘lmadingiz!" });
+            return;
+        }
 
-    // ===== REFERAL =====
-    if (text === "Referal Link") {
-        const link = `https://t.me/RICHBOY_RoBoT?start=${userId}`;
-        return bot.sendMessage(userId, `🔗 Sizning referal link: ${link}\n💰 Har bir qo‘shilgan do‘st uchun: ${config.refAmount || 50} so'm`);
-    }
+        /* ===================== USER ===================== */
+        if (data === "show_balance") {
+            const msgText = `
+🔑 Sizning ID raqamingiz: <code>${userId}</code>
+💰 Balans: <b>${user.balance}</b> so'm
+💳 Yechib olgan pullaringiz: <b>${user.withdrawn || 0}</b> so'm
+📝 Takliflar: <b>${user.refCount || 0}</b> ta
+`;
+            const buttons = [[{ text: "💸 Pulni yechish 🏧", callback_data: "withdraw_balance" }]];
+            await bot.sendMessage(userId, msgText, { parse_mode: "HTML", reply_markup: { inline_keyboard: buttons } });
+            return showMainMenu(userId);
+        }
 
-    // ===== YECHIB OLISH =====
-    if (text === "Yechib olish") {
-        if (user.balance < 10000) return bot.sendMessage(userId, "⚠️ Minimal yechib olish 10.000 so‘m!");
+        if (data === "get_bonus") {
+            const now = new Date();
+            if (user.lastBonus && new Date(user.lastBonus).toDateString() === now.toDateString())
+                return await bot.sendMessage(userId, "⚠️ Bugun bonus olgansiz!").then(() => showMainMenu(userId));
 
-        const askAmount = async () => {
-            bot.sendMessage(userId, `💰 Balansingiz: ${user.balance} so'm\n✍️ Qancha summa yechib olmoqchisiz?`).then(() => {
+            await User.updateOne({ userId }, { $inc: { balance: config.bonusAmount }, $set: { lastBonus: now } });
+            await bot.sendMessage(userId, `🎁 ${config.bonusAmount} so‘m bonus berildi!`);
+            return showMainMenu(userId);
+        }
+        // =================== REFERAL VA ULASHISH FUNKSIYASI ===================
+        if (data === "ref_link") {
+            try {
+                const link = `https://t.me/${process.env.BOT_USERNAME}?start=${userId}`;
+                const bonus = config.refAmount;
+
+                const shareText =
+                    `🎉 Salom! Senga maxsus taklif!  
+Ushbu ajoyib botga qo‘shil va darhol bonus ol! 💰  
+🔗 Boshlab yubor: ${link}  
+💸 Har bir do‘st qo‘shilishi bilan ${bonus} so‘m bonus senga ham beriladi!  
+🚀 Tezroq qo‘shil, imkoniyatni boy berma!`;
+
+                await bot.sendMessage(userId, shareText, {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: "📤 Do‘stlarim bilan ulashish", url: `https://t.me/share/url?url=${link}&text=${encodeURIComponent(shareText)}` }
+                            ]
+                        ]
+                    }
+                });
+
+                return showMainMenu(userId);
+            } catch (err) {
+                console.error("❌ Referal funksiyasi xatosi:", err);
+            }
+        }
+
+        // =================== /start Bilan REFERAL BONUS ===================
+        bot.onText(/\/start(?: (\d+))?/, async (msg, match) => {
+            const newUserId = msg.from.id;
+            const refId = match[1] ? parseInt(match[1]) : null;
+
+            try {
+                // Yangi foydalanuvchi yaratish yoki topish
+                let newUser = await User.findOne({ telegramId: newUserId });
+                if (!newUser) {
+                    newUser = await User.create({
+                        telegramId: newUserId,
+                        balance: 0,
+                        referrals: [],
+                        refFrom: refId || null
+                    });
+                }
+
+                // Agar refId mavjud bo‘lsa va foydalanuvchi o‘zini referal qilmagan bo‘lsa
+                if (refId && refId !== newUserId) {
+                    const refUser = await User.findOne({ telegramId: refId });
+                    const config = await Config.findOne();
+
+                    if (refUser && config) {
+                        if (!refUser.referrals.includes(newUserId)) {
+                            // Bonus qo‘shish
+                            refUser.balance += config.refAmount;
+                            refUser.referrals.push(newUserId);
+                            await refUser.save();
+
+                            // Foydalanuvchiga habar yuborish
+                            await bot.sendMessage(refId,
+                                `🎉 Siz yangi do‘st qo‘shdingiz!\n` +
+                                `💰 Sizning balansingizga ${config.refAmount} so'm qo‘shildi.\n` +
+                                `👥 Do‘stlaringiz soni: ${refUser.referrals.length}`
+                            );
+                        }
+                    }
+                }
+
+            } catch (err) {
+                console.error("❌ Referal xatosi:", err);
+            }
+
+            return showMainMenu(newUserId);
+        });
+
+
+        if (data === "withdraw_balance") {
+            const askAmount = async () => {
+                await bot.sendMessage(userId, `💰 Balansingiz: ${user.balance} so'm\n✍️ Qancha summa yechib olmoqchisiz? (Minimal: ${config.minWithdraw} so'm)`);
                 bot.once('message', async (msgSum) => {
                     const amount = Number(msgSum.text);
-                    if (!amount || amount < 10000 || amount > user.balance) 
-                        return bot.sendMessage(userId, "❌ Noto‘g‘ri summa!");
+                    if (!amount || amount < config.minWithdraw || amount > user.balance) {
+                        await bot.sendMessage(userId, `❌ Noto‘g‘ri summa! Minimal: ${config.minWithdraw}, maksimal: ${user.balance}`);
+                        return showMainMenu(userId);
+                    }
                     sendWithdrawToAdmin(userId, amount, user.cardNumber, user.fullName);
-                    bot.sendMessage(userId, "✅ So‘rov yuborildi, admin tasdiqlashini kuting");
+                    await bot.sendMessage(userId, "✅ So‘rov yuborildi, admin tasdiqlashini kuting");
+                    return showMainMenu(userId);
                 });
-            });
-        };
+            };
 
-        if (!user.cardNumber || !user.fullName) {
-            bot.sendMessage(userId, "💳 Iltimos karta raqamingizni kiriting:").then(() => {
+            if (!user.cardNumber || !user.fullName) {
+                await bot.sendMessage(userId, "💳 Iltimos karta raqamingizni kiriting:");
                 bot.once('message', async (msgCard) => {
                     const cardNumber = msgCard.text;
-                    bot.sendMessage(userId, "📝 To‘liq ism va familiyangizni kiriting:").then(() => {
-                        bot.once('message', async (msgName) => {
-                            const fullName = msgName.text;
-                            await User.updateOne({ userId }, { $set: { cardNumber, fullName } });
-                            await askAmount();
-                        });
+                    await bot.sendMessage(userId, "📝 To‘liq ism va familiyangizni kiriting:");
+                    bot.once('message', async (msgName) => {
+                        const fullName = msgName.text;
+                        await User.updateOne({ userId }, { $set: { cardNumber, fullName } });
+                        return askAmount();
                     });
                 });
-            });
-        } else await askAmount();
-        return;
-    }
-
-    // ===== ADMIN =====
-    if (isAdmin) {
-        if (text === "Reklama yuborish") {
-            bot.sendMessage(userId, "Xabar matnini yuboring:").then(() => {
-                bot.once('message', async (msg2) => {
-                    const users = await User.find();
-                    users.forEach(u => bot.sendMessage(u.userId, msg2.text).catch(() => {}));
-                    bot.sendMessage(userId, "✅ Reklama yuborildi");
-                });
-            });
+            } else return askAmount();
         }
 
-        // ===== KANAL QO‘SHISH =====
-        if (text === "Kanal qo‘shish") {
-            bot.sendMessage(userId, "Kanal username kiriting (@ bilan):").then(() => {
+        /* ===================== ADMIN ===================== */
+        if (ADMINS.includes(userId)) {
+            const askNumberAndSave = async (question, field) => {
+                await bot.sendMessage(userId, question);
                 bot.once('message', async (msg2) => {
-                    const ch = msg2.text.trim();
-                    if (!ch.startsWith('@')) return bot.sendMessage(userId, "❌ @ bilan boshlanishi kerak!");
-                    const cfg = await getConfig();
-                    if (cfg.requiredChannels.includes(ch)) 
-                        return bot.sendMessage(userId, "❌ Kanal allaqachon mavjud!");
-                    cfg.requiredChannels.push(ch);
-                    await cfg.save();
-                    bot.sendMessage(userId, `✅ Kanal qo‘shildi: ${ch}`);
-                });
-            });
-        }
-
-        // ===== KANAL O‘CHIRISH =====
-        if (text === "Kanal o‘chirish") {
-            bot.sendMessage(userId, "O‘chirmoqchi bo‘lgan kanal (@ bilan):").then(() => {
-                bot.once('message', async (msg2) => {
-                    const ch = msg2.text.trim();
-                    const cfg = await getConfig();
-                    if (cfg.requiredChannels.includes(ch)) {
-                        cfg.requiredChannels = cfg.requiredChannels.filter(c => c !== ch);
-                        await cfg.save();
-                        bot.sendMessage(userId, `✅ Kanal o‘chirildi: ${ch}`);
-                    } else bot.sendMessage(userId, "❌ Kanal topilmadi!");
-                });
-            });
-        }
-
-        // ===== REFERAL PULINI SOZLASH =====
-        if (text === "Referal pulini sozlash") {
-            bot.sendMessage(userId, "Referal pulini kiriting:").then(() => {
-                bot.once('message', async (msg2) => {
-                    const amount = Number(msg2.text);
-                    if (!isNaN(amount)) {
+                    const val = Number(msg2.text);
+                    if (!isNaN(val)) {
                         const cfg = await getConfig();
-                        cfg.refAmount = amount;
+                        cfg[field] = val;
                         await cfg.save();
-                        bot.sendMessage(userId, `✅ Referal summasi o‘zgartirildi: ${amount} so'm`);
-                    } else bot.sendMessage(userId, "❌ Raqam kiriting!");
+                        await bot.sendMessage(userId, `✅ ${field} o‘zgartirildi: ${val}`);
+                    } else await bot.sendMessage(userId, "❌ Raqam kiriting!");
+                    return showMainMenu(userId);
                 });
-            });
+            };
+
+            if (data === "set_bonus") return askNumberAndSave("🎁 Bonus summasini kiriting:", "bonusAmount");
+            if (data === "set_min_withdraw") return askNumberAndSave("💸 Minimal yechish miqdorini kiriting:", "minWithdraw");
+            if (data === "set_ref") return askNumberAndSave("💎 Referal summasini kiriting:", "refAmount");
+
+            if (data === "add_channel") {
+                await bot.sendMessage(userId, "➕ Kanal username kiriting (misol: @kanalname):");
+                bot.once('message', async (msg2) => {
+                    const ch = msg2.text.trim();
+                    const cfg = await getConfig();
+                    if (!cfg.requiredChannels.includes(ch)) {
+                        cfg.requiredChannels.push(ch);
+                        await cfg.save();
+                        await bot.sendMessage(userId, `✅ Kanal qo‘shildi: ${ch}`);
+                    } else await bot.sendMessage(userId, "❌ Kanal allaqachon mavjud!");
+                    return showMainMenu(userId);
+                });
+            }
+
+            if (data === "remove_channel") {
+                await bot.sendMessage(userId, "❌ O‘chiriladigan kanal username kiriting (misol: @kanalname):");
+                bot.once('message', async (msg2) => {
+                    const ch = msg2.text.trim();
+                    const cfg = await getConfig();
+                    const index = cfg.requiredChannels.indexOf(ch);
+                    if (index !== -1) {
+                        cfg.requiredChannels.splice(index, 1);
+                        await cfg.save();
+                        await bot.sendMessage(userId, `✅ Kanal o‘chirildi: ${ch}`);
+                    } else await bot.sendMessage(userId, "❌ Kanal topilmadi!");
+                    return showMainMenu(userId);
+                });
+            }
+
+            if (data === "send_ad") {
+                await bot.sendMessage(userId, "📢 Reklama matnini kiriting:");
+                bot.once('message', async (msg2) => {
+                    const text = msg2.text;
+                    const users = await User.find({});
+                    for (const u of users) {
+                        await bot.sendMessage(u.userId, `📢 Admindan reklama:\n\n${text}`).catch(() => { });
+                    }
+                    await bot.sendMessage(userId, `✅ Reklama ${users.length} foydalanuvchiga yuborildi!`);
+                    return showMainMenu(userId);
+                });
+            }
         }
+
+    } catch (err) {
+        console.log("❌ callback_query error:", err.message);
     }
 });
 
 /* ===================== HELPER: SEND WITHDRAW TO ADMIN ===================== */
 function sendWithdrawToAdmin(userId, amount, cardNumber, fullName) {
-    const username = `@${userId}`;
-    ADMINS.forEach(adminId => {
-        bot.sendMessage(adminId,
-`💰 Yechib olish so‘rovi!
+    ADMINS.forEach(async adminId => {
+        await bot.sendMessage(adminId,
+            `💰 Yechib olish so‘rovi!
 
-👤 User: ${username}
-🆔 ID: ${userId}
+👤 User ID: ${userId}
 💰 Summa: ${amount} so'm
 💳 Karta raqami: ${cardNumber || "Yo'q"}
 📝 Egasi: ${fullName || "Yo'q"}`, {
@@ -263,6 +378,6 @@ function sendWithdrawToAdmin(userId, amount, cardNumber, fullName) {
                     { text: "💸 Pul to‘landi", callback_data: `paid_${userId}_${amount}` }
                 ]]
             }
-        });
+        }).catch(() => { });
     });
 }
